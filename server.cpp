@@ -12,15 +12,13 @@
 #include "errhelp.h"
 #include "constants.h"
 #include <vector>
+#include <string>
 #include <poll.h>
 #include <fcntl.h>
 #include <assert.h>
-#include <map>
 #include "hashtable.h"
-
-#define container_of(ptr, T, member)\
-    ((T *)( (char *)ptr-offsetof(T, member) ))
-
+#include "commonops.h"
+#include "zset.h"
 
 
 
@@ -96,10 +94,11 @@ static Conn* handle_accept(int fd){
 }
 
 
+//================================== reading and parsing requests ==================================//
+
 // +------+-----+------+-----+------+-----+-----+------+
 // | nstr | len | str1 | len | str2 | ... | len | strn |
 // +------+-----+------+-----+------+-----+-----+------+
-
 static bool 
 read_prefix(const uint8_t *&cur, const u_int8_t *end, u_int32_t &out){
     if (cur+4>end){
@@ -148,27 +147,14 @@ parse_req(const uint8_t *data, size_t size, std::vector<std::string> &out){
     return 0;
 }
 
-// Response::status
+
+//================================== Data serialisation and output related code ==================================//
+// error code for TAG_ERR
 enum {
-    RES_OK = 0,
-    RES_ERR = 1,    // error
-    RES_NF = 2,     // key not found
-};
-
-// +--------+---------+
-// | status | data... |
-// +--------+---------+
-struct Response {
-    uint32_t status = 0;
-    std::vector<uint8_t> data;
-};
-
-// new serialisation format to be output directly to Conn::outgoing
-
-// error code to TAG_ERR
-enum {
-    ERR_UNKNOWN = 1,
-    ERR_TOO_BIG = 2,
+    ERR_UNKNOWN = 1,    // unknown command
+    ERR_TOO_BIG = 2,    // response too big
+    ERR_BAD_TYP = 3,    // unexpected value type
+    ERR_BAD_ARG = 4,    // bad arguments
 };
 
 // the data types that we support
@@ -215,7 +201,7 @@ static void out_int(Buffer &out, const int64_t val){
 }
 
 static void out_dbl(Buffer &out, double val){
-    buf_append_u8(out, TAG_STR);
+    buf_append_u8(out, TAG_DBL);
     buf_append_dbl(out, val);
 }
 
@@ -231,78 +217,123 @@ static void out_arr(Buffer &out, uint32_t n){
     buf_append_u32(out, n);
 }
 
+// used for zqueries
+static size_t out_begin_arr(Buffer &out){
+    out.push_back(TAG_ARR);
+    buf_append_u32(out, 0);     // filled by out_end_arr()
+    return out.size()-4;        // the `ctx` arg
+}
+static void out_end_arr(Buffer &out, size_t ctx, uint32_t n){
+    assert(out[ctx-1]==TAG_ARR);
+    memcpy(&out[ctx], &n, 4);
+}
 
-//==============================hash table related code=======================
+
+//================================== hashtable and container structures ==================================//
 static struct{
     HMap db;    // top-level hashtable
 }g_data;
 
-// kv pair for the top-level hashtable
-struct Entry {
+enum {
+    T_INIT  = 0,
+    T_STR   = 1,
+    T_ZSET  = 2,
+};
+
+/*
+other design choices exists, but add complexity
+1. use a union for the types, need to explicitly call constructor and destructor, complicated
+2. define 2 subtypes and use runtime polymorphism extra definitions and need to know type, complicated
+*/
+struct Entry {  // kv pair for the top-level hashtable
     struct HNode node;  // hash table node
     std::string key;
-    std::string val;
+    // specify the type of value
+    uint32_t type = 0;
+    // value is one of the following
+    std::string str;
+    ZSet zset;
+};
+
+static Entry *entry_new(uint32_t type){
+    Entry *ent = new Entry();
+    ent->type = type;
+    return ent;
+}
+
+static void entry_del(Entry* ent){
+    if (ent->type==T_ZSET){
+        zset_clear(&ent->zset);
+    }
+    delete ent;
+}
+
+// used for lookup as it is more compact than Entry
+struct LookupKey {
+    struct HNode node;
+    std::string key;
 };
 
 // Equality comparison for `struct entry`
-static bool entry_eql(HNode* lhs, HNode* rhs){
-    struct Entry *le = container_of(lhs, struct Entry, node);
-    struct Entry *re = container_of(rhs, struct Entry, node);
-    return le->key == re->key;
+static bool entry_eql(HNode* node, HNode* key){
+    struct Entry *ent = container_of(node, struct Entry, node);
+    struct LookupKey *keydata = container_of(key, struct LookupKey, node);
+    return ent->key == keydata->key;
 }
 
-// the FNV hash function we use for our hash table
-static uint64_t str_hash(const uint8_t* data, size_t len){
-    uint64_t h=0x811C9DC5;
-    for (size_t i = 0; i < len; i++){
-        h = (h+data[i])*0x01000193;
-    }
-    return h;
-}
+
+//================================== GET SET DEL KEYS queries ==================================//
 
 // Function for performing the GET request
 static void do_get(std::vector<std::string> &cmd, Buffer &out){
-    // A dummy `Entry` with a node embedded in it just for the lookup
-    Entry key;
-    key.key.swap(cmd[1]);   // target key we are looking for
+    // a dummy struct just for the lookup
+    LookupKey key;
+    key.key.swap(cmd[1]);
     key.node.hval = str_hash((uint8_t*)key.key.data(), key.key.size());
     // hashtable lookup
     HNode* node = hm_lookup(&g_data.db, &key.node, &entry_eql);
-    if (!node){
+    if (!node) {
         return out_nil(out);
     }
     // copy the value
-    const std::string &val = container_of(node, Entry, node)->val;
-    assert(val.size()<=k_max_args);
-    return out_str(out, val.data(), val.size());
+    Entry *ent = container_of(node, Entry, node);
+    if(ent->type != T_STR){
+        return out_err(out, ERR_BAD_TYP, "Not a string value");
+    }
+    return out_str(out, ent->str.data(), ent->str.size());
 }
 
 static void do_set(std::vector<std::string> &cmd, Buffer &out){
-    Entry key;
+    LookupKey key;
     key.key.swap(cmd[1]);
     key.node.hval = str_hash((uint8_t*)key.key.data(), key.key.size());
+    // hashtable lookup
     HNode* node = hm_lookup(&g_data.db, &key.node, &entry_eql);
-    if (node){
-        container_of(node, Entry, node)->val.swap(cmd[2]);
+    if (node) {
+        Entry *ent = container_of(node, Entry, node);
+        if(ent->type!=T_STR){
+            return out_err(out, ERR_BAD_TYP, "Not a string value!");
+        }
+        ent->str.swap(cmd[2]);
     } else {
-        Entry *ent = new Entry();
+        Entry* ent = entry_new(T_STR);
         ent->key.swap(key.key);
         ent->node.hval = key.node.hval;
-        ent->val.swap(cmd[2]);
+        ent->str.swap(cmd[2]);
         hm_insert(&g_data.db, &ent->node);
     }
     return out_nil(out);
 }
 
 static void do_del(std::vector<std::string> &cmd, Buffer &out){
-    Entry key;
+    LookupKey key;
     key.key.swap(cmd[1]);
-    key.node.hval = str_hash((uint8_t *)key.key.data(), key.key.size());
-    HNode *node = hm_delete(&g_data.db, &key.node, &entry_eql);
-    if (node){
-        delete container_of(node, Entry, node);
+    key.node.hval = str_hash((uint8_t*)key.key.data(), key.key.size());
+    HNode* node = hm_delete(&g_data.db, &key.node, &entry_eql);
+    if (node) {
+        entry_del(container_of(node, Entry, node));
     }
-    return out_int(out, node ? 1 : 0);  // return the number of deleted keys
+    return out_int(out, node ? 1 : 0);
 }
 
 // the call back function on each key
@@ -318,6 +349,140 @@ static void do_keys(std::vector<std::string> &, Buffer &out){
     hm_foreach(&g_data.db, &cb_keys, (void *)&out);
 }
 
+//================================== Redis range and rank related queries ==================================//
+
+// utility functions to convert string to int and double respectively
+static bool str2dbl(const std::string& s, double& out){
+    char* endp = nullptr;
+    out = strtod(s.c_str(), &endp);
+    return endp == s.c_str()+s.size() && !isnan(out);
+}
+static bool str2int(const std::string& s, int64_t& out){
+    char* endp = nullptr;
+    out = strtoll(s.c_str(), &endp, 10);
+    return endp == s.c_str()+s.size();
+}
+
+//+------+------+-------+------+
+//| ZADD | zset | score | name |
+//+------+------+-------+------+
+static void do_zadd(std::vector<std::string>& cmd, Buffer& out){
+    double score = 0;
+    if (!str2dbl(cmd[2], score)){
+        return out_err(out, ERR_BAD_ARG, "Expected float");
+    }
+
+    // lookup or create the zset
+    LookupKey key;
+    key.key.swap(cmd[1]);
+    key.node.hval = str_hash((uint8_t*)key.key.data(), key.key.size());
+    HNode* hnode = hm_lookup(&g_data.db, &key.node, &entry_eql);
+
+    Entry* ent = nullptr;
+    if (!hnode) {
+        ent = entry_new(T_ZSET);
+        ent->key.swap(key.key);
+        ent->node.hval = key.node.hval;
+        hm_insert(&g_data.db, &ent->node);
+    } else {
+        ent = container_of(hnode, Entry, node);
+        if(ent->type != T_ZSET){
+            return out_err(out, ERR_BAD_TYP, "expected zset");
+        }
+    }
+
+    const std::string &name = cmd[3];
+    bool added = zset_insert(&ent->zset, name.data(), name.size(), score);
+    return out_int(out, (int64_t)added);
+}
+
+static const ZSet k_empty_zset; // an empty zset
+
+static ZSet* expect_zset(std::string& s){
+    LookupKey key;
+    key.key.swap(s);
+    key.node.hval = str_hash((uint8_t*)key.key.data(), key.key.size());
+    HNode* hnode = hm_lookup(&g_data.db, &key.node, &entry_eql);
+    if (!hnode){    // a non-existent key is treated as an empty zset
+        return (ZSet*)&k_empty_zset;
+    }
+    Entry* ent = container_of(hnode, Entry, node);
+    return ent->type == T_ZSET ? &ent->zset : nullptr;
+}
+
+//+------+------+------+
+//| ZREM | zset | name |
+//+------+------+------+
+static void do_zrem(std::vector<std::string>& cmd, Buffer &out){
+    ZSet* zset = expect_zset(cmd[1]);
+    if (!zset){
+        return out_err(out, ERR_BAD_TYP, "Expected zset");
+    }
+
+    const std::string &name = cmd[2];
+    ZNode* znode = zset_lookup(zset, name.data(), name.size());
+    if (znode){
+        zset_delete(zset, znode);
+    }
+    return out_int(out, znode ? 1 : 0);
+}
+
+//+--------+------+------+
+//| ZSCORE | zset | name |
+//+--------+------+------+
+static void do_zscore(std::vector<std::string>& cmd, Buffer &out) {
+    ZSet* zset = expect_zset(cmd[1]);
+    if (!zset){
+        return out_err(out, ERR_BAD_TYP, "Expected zset");
+    }
+
+    const std::string &name = cmd[2];
+    ZNode* znode = zset_lookup(zset, name.data(), name.size());
+    return znode ? out_dbl(out, znode->score) : out_nil(out);
+}
+
+//+--------+-----+-------+------+--------+-------+-----+------+
+//| ZQUERY | key | score | name | offset | limit | len | strn |
+//+--------+-----+-------+------+--------+-------+-----+------+
+static void do_zquery(std::vector<std::string>& cmd, Buffer& out) {
+    // parse arguments
+    double score = 0;
+    if (!str2dbl(cmd[2], score)){
+        return out_err(out, ERR_BAD_ARG, "Expected float");
+    }
+    const std::string &name = cmd[3];
+    int64_t offset = 0, limit = 0;
+    if (!str2int(cmd[4], offset) || !str2int(cmd[5], limit)){
+        return out_err(out, ERR_BAD_ARG, "Expected int");
+    }
+
+    // get the zset
+    ZSet* zset = expect_zset(cmd[1]);
+    if (!zset) {
+        return out_err(out, ERR_BAD_TYP, "Expected zset");
+    }
+
+    // seek the key
+    if (limit <= 0){
+        return out_arr(out, 0);
+    }
+    ZNode* znode = zset_seekge(zset, score, name.data(), name.size());
+    znode = znode_offset(znode, offset);
+
+    // output
+    size_t ctx = out_begin_arr(out);
+    int64_t n = 0;
+    while(znode && n < limit){
+        out_str(out,znode->name, znode->len);
+        out_dbl(out, znode->score);
+        znode = znode_offset(znode, +1);
+        n += 2;
+    }
+    out_end_arr(out, ctx, (uint32_t)n);
+}
+
+//================================== Code for handling reads/writes, requests, preparing responses ==================================//
+
 static void handle_request(std::vector<std::string> &cmd, Buffer &out){
     if (cmd.size()==2 && cmd[0]=="GET"){
         return do_get(cmd, out);
@@ -327,8 +492,16 @@ static void handle_request(std::vector<std::string> &cmd, Buffer &out){
         return do_del(cmd, out);
     } else if (cmd.size()==1 && cmd[0]=="KEYS"){
         return do_keys(cmd, out);
+    } else if (cmd.size()==4 && cmd[0]=="ZADD") {
+        return do_zadd(cmd, out);
+    } else if (cmd.size()==3 && cmd[0]=="ZREM") {
+        return do_zrem(cmd, out);
+    } else if (cmd.size()==3 && cmd[0]=="ZSCORE") {
+        return do_zscore(cmd, out);
+    } else if (cmd.size()==6 && cmd[0]=="ZQUERY") {
+        return do_zquery(cmd, out);
     } else {
-        return out_err(out, ERR_UNKNOWN, "unknown command.");
+        return out_err(out, ERR_UNKNOWN, "Unknown command.");
     }
 }
 
@@ -453,9 +626,8 @@ static void handle_read(Conn* conn){
 }
 
 
+//======================================== main server program ========================================//
 
-
-// main server program
 int main(void){
     // 1. create listening fd
     int fd = socket(AF_INET, SOCK_STREAM, 0);
