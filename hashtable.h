@@ -36,3 +36,5 @@ void   hm_clear(HMap* hmap);
 size_t hm_size(HMap* hmap);
 // invoke the callback on each node until it returns false
 void hm_foreach(HMap *hmap, bool (*f)(HNode *, void *), void *arg);
+// used to check if 2 hnode pointers are pointing to the same one or not
+bool hnode_same(HNode* node, HNode* key);

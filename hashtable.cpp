@@ -2,6 +2,12 @@
 #include <stdlib.h>
 #include "hashtable.h"
 
+
+// checks whether 2 hnodes are the same or not
+bool hnode_same(HNode* node, HNode* key){
+    return node == key;
+}
+
 // n must be a power of 2
 static void h_init(HTab *htab, size_t n){
     assert(n>0 && ((n-1)&n)==0);
