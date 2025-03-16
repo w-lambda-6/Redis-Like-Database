@@ -21,6 +21,7 @@
 #include "zset.h"
 #include "cdlist.h"
 #include "cache.h"
+#include "ThreadPool.h"
 
 
 //========================================= utility functions =========================================//
@@ -54,6 +55,13 @@ static bool str2int(const std::string& s, int64_t& out){
     char* endp = nullptr;
     out = strtoll(s.c_str(), &endp, 10);
     return endp == s.c_str()+s.size();
+}
+
+// function for getting the monotonic seconds
+static uint64_t get_monotonic_msecs(){
+    struct timespec tv = {0, 0};
+    clock_gettime(CLOCK_MONOTONIC, &tv);
+    return uint64_t(tv.tv_sec)*1000+tv.tv_nsec/1000/1000;
 }
 
 
@@ -94,6 +102,7 @@ static struct{
     std::vector<Conn*> fd2conn;
     CDNode idle_list;
     std::vector<HeapNode> cache;
+    ThreadPool thread_pool;
 }g_data;
 
 static void conn_destroy(Conn *conn){
@@ -105,13 +114,6 @@ static void conn_destroy(Conn *conn){
 
 
 //========================================= code for accepting connnections =========================================//
-
-// function for getting the monotonic seconds
-static uint64_t get_monotonic_msecs(){
-    struct timespec tv = {0, 0};
-    clock_gettime(CLOCK_MONOTONIC, &tv);
-    return uint64_t(tv.tv_sec)*1000+tv.tv_nsec/1000/1000;
-}
 
 // application callback when the listening socket is ready
 static int32_t handle_accept(int fd){
@@ -321,12 +323,30 @@ static void entry_set_ttl(Entry* ent, int64_t ttl_ms){
     }
 }
 
-static void entry_del(Entry* ent){
-    if (ent->type==T_ZSET){
+static void entry_del_sync(Entry* ent){
+    if (ent->type == T_ZSET){
         zset_clear(&ent->zset);
     }
-    entry_set_ttl(ent, -1);// remove from cache if it is in it
     delete ent;
+}
+
+static void entry_del_func(void* arg){
+    entry_del_sync((Entry*) arg);
+}
+
+static void entry_del(Entry* ent){
+    // unlink it from any data struture
+    entry_set_ttl(ent, -1);
+    // run the destructor in a thread pool for large data structures
+    size_t set_size = (ent->type == T_ZSET) ? hm_size(&ent->zset.hmap) : 0;
+    const size_t k_large_container_size = 1000;
+    if (set_size > k_large_container_size) {
+        // large, handled by another worker thread
+        g_data.thread_pool.produce(&entry_del_func, ent);
+    } else {
+        // small, handled directly to avoid context switches
+        entry_del_sync(ent);
+    }
 }
 
 // used for lookup as it is more compact than Entry
@@ -418,7 +438,7 @@ static void do_persist(std::vector<std::string>& cmd, Buffer& out){
 
 //================================== GET SET DEL KEYS queries ==================================//
 
-// Function for performing the GET request
+
 static void do_get(std::vector<std::string> &cmd, Buffer &out){
     // a dummy struct just for the lookup
     LookupKey key;
@@ -817,6 +837,7 @@ static void process_timers(){
 int main(void){
     // initialisation of the timer list
     cdlist_init(&g_data.idle_list);
+    g_data.thread_pool.init(4);
 
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if(fd<0){
